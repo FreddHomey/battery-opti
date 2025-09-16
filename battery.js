@@ -31,6 +31,9 @@ const roundTripEff         = 0.92;
 const chargeEff            = Math.sqrt(roundTripEff);
 const dischargeEff         = Math.sqrt(roundTripEff);
 
+// Marginalkrav för urladdning (batterislitage)
+const minimumSellMargin_SEK = 0.50; // kräver minst 50 öre vinst per kWh
+
 // Pris-klasser
 const cheapPercent       = 0.30; // billigaste 30% → ladda
 const expensiveTop10Pct  = 0.10; // dyraste 10% → sälj (export OK)
@@ -41,6 +44,16 @@ const allowGridChargeWhenCheap          = true; // tillåten import i cheap
 const allowGridChargeToMeetTomorrowGoal = true; // ladda mot mål till midnatt om lönsamt
 const pvNoiseFloor_kW = 0.01;
 
+// Håll morgonbuffert för solenergi (används främst mars–sept)
+const solarReserve = {
+  enabled: true,
+  maxMorningSoC: 0.75,     // 75% → lämna ~25% ledigt för PV
+  startHour: 0,            // gäller från midnatt …
+  releaseHour: 11,         // … till kl 11 (exklusive)
+  monthsActive: [3,4,5,6,7,8,9], // mars–sept (1=jan)
+  skipExpensiveHours: false // true = hoppa över timmar som är klassade som dyra
+};
+
 // “Mid”/buffert
 const midDischargeFloorSoC = HARD_MIN_SOC; // gå inte under hård min i mid
 const priceMidBias         = 1.0;          // 1.0 => tröskel = dagens snittpris
@@ -49,7 +62,30 @@ const priceMidBias         = 1.0;          // 1.0 => tröskel = dagens snittpris
 function round2(x){ return Math.round(x * 100) / 100; }
 function round3(x){ return Math.round(x * 1000) / 1000; }
 function clamp01(x){ return Math.min(1, Math.max(0, x)); }
-function capSoCForHour(){ return HARD_MAX_SOC; } // hårt tak 90%
+const socCapOverrides = new Map();
+
+function hourKey(date) {
+  if (!date) return null;
+  const dt = new Date(date);
+  if (Number.isNaN(dt.getTime())) return null;
+  dt.setMinutes(0, 0, 0);
+  return dt.toISOString();
+}
+
+function setSocCapOverride(date, cap) {
+  const key = hourKey(date);
+  if (!key) return;
+  const limited = Math.min(HARD_MAX_SOC, Math.max(HARD_MIN_SOC, clamp01(cap)));
+  if (!socCapOverrides.has(key)) socCapOverrides.set(key, limited);
+  else socCapOverrides.set(key, Math.min(socCapOverrides.get(key), limited));
+}
+
+function capSoCForHour(date){
+  const key = hourKey(date);
+  if (!key) return HARD_MAX_SOC;
+  const override = socCapOverrides.get(key);
+  return (override != null) ? override : HARD_MAX_SOC;
+} // hårt tak 90%
 
 function normalizeMode(m) {
   if (m === 'charge' || m === 'discharge' || m === 'idle') return m;
@@ -58,14 +94,65 @@ function normalizeMode(m) {
 }
 
 // Skriv taggar med wrapper-objekt (fix för vissa Flow-körningar)
-function setTagString(name, value) {
-  try { tag(name, new String(String(value ?? ""))); }
-  catch(e) { console.error(`❌ tag '${name}' (String)`, String(e)); }
+function tagErrorMessage(err) {
+  if (!err) return "";
+  if (typeof err === "string") return err;
+  if (typeof err === "object") {
+    const known = err.message || err.error || err.reason;
+    if (typeof known === "string" && known.trim() !== "") return known;
+    try { return JSON.stringify(err); }
+    catch (_) { /* ignore */ }
+  }
+  return String(err);
 }
-function setTagNumber(name, value) {
+
+async function updateTag(name, expectedType, candidates) {
+  if (typeof tag !== "function") return true;
+
+  let lastError = null;
+  for (const candidate of candidates) {
+    try {
+      const result = await tag(name, candidate);
+      const failure = (result === false)
+        || (result && typeof result === "object" && (
+             result.success === false
+             || result.ok === false
+             || result.result === false
+             || (result.error != null)
+           ));
+      if (failure) {
+        lastError = result;
+        continue;
+      }
+      return true;
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  const message = (lastError === false) ? "tag() returned false" : tagErrorMessage(lastError);
+  console.error(`❌ tag '${name}' (${expectedType})`, message || "okänt fel");
+  return false;
+}
+
+async function setTagString(name, value) {
+  const str = String(value ?? "");
+  const candidates = [
+    { type: "String", value: str },
+    new String(str),
+    str
+  ];
+  return updateTag(name, "String", candidates);
+}
+
+async function setTagNumber(name, value) {
   const num = Number.isFinite(value) ? Number(value) : 0;
-  try { tag(name, new Number(num)); }
-  catch(e) { console.error(`❌ tag '${name}' (Number)`, String(e)); }
+  const candidates = [
+    { type: "Number", value: num },
+    new Number(num),
+    num
+  ];
+  return updateTag(name, "Number", candidates);
 }
 
 // --- Argument ---
@@ -122,6 +209,44 @@ function balanceCheck({ prod_kW, load_kW, gridImport_kW, gridExport_kW, battChar
   const right = load_kW + gridExport_kW + battCharge_kW;
   const diff = left - right;
   return { left: round3(left), right: round3(right), diff: round3(diff), ok: Math.abs(diff) < 0.2 };
+}
+
+function averagePriceForSet(hours, keySet, field) {
+  if (!Array.isArray(hours) || !(keySet instanceof Set) || keySet.size === 0) return NaN;
+  let sum = 0;
+  let count = 0;
+  for (const h of hours) {
+    if (!h || !h.start || !keySet.has(h.start)) continue;
+    const value = Number(h?.[field]);
+    if (!Number.isFinite(value)) continue;
+    sum += value;
+    count += 1;
+  }
+  return count > 0 ? (sum / count) : NaN;
+}
+
+function sellMarginOk(sellPrice, baselineBuyPrice) {
+  if (!Number.isFinite(sellPrice) || !Number.isFinite(baselineBuyPrice)) return false;
+  const effectiveCost = baselineBuyPrice / roundTripEff;
+  return (sellPrice - effectiveCost) >= minimumSellMargin_SEK;
+}
+
+function marginBaselineForSlot(slotStartISO, avgCheapToday, avgCheapTomorrow, avgCheapAll) {
+  const fallback = Number.isFinite(avgCheapAll) ? avgCheapAll : (Number.isFinite(avgCheapToday) ? avgCheapToday : NaN);
+  if (!slotStartISO) return fallback;
+  const dt = new Date(slotStartISO);
+  if (Number.isNaN(dt.getTime())) return fallback;
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const tomorrow = new Date(today.getTime() + 24 * 60 * 60 * 1000);
+  const dayAfter = new Date(tomorrow.getTime() + 24 * 60 * 60 * 1000);
+  if (dt >= today && dt < tomorrow) {
+    return Number.isFinite(avgCheapToday) ? avgCheapToday : fallback;
+  }
+  if (dt >= tomorrow && dt < dayAfter) {
+    return Number.isFinite(avgCheapTomorrow) ? avgCheapTomorrow : fallback;
+  }
+  return fallback;
 }
 
 // =================== PRISER ===================
@@ -188,7 +313,7 @@ function priceStateNow(hours, classes) {
     const e = new Date(h.end);
     return now >= s && now < e;
   });
-  if (!slot) return { state: "normal", price: NaN, slot: null, inTop10:false, inNext30:false, inCheap:false };
+  if (!slot) return { state: "normal", price: NaN, sellPrice: NaN, slot: null, inTop10:false, inNext30:false, inCheap:false };
   const key = slot.start;
   const inCheap  = classes.cheapSet.has(key);
   const inTop10  = classes.expTop10.has(key);
@@ -198,7 +323,79 @@ function priceStateNow(hours, classes) {
   if (inCheap) state = "cheap";
   else if (inTop10 || inNext30) state = "expensive";
 
-  return { state, price: slot.buy_SEK, slot, inTop10, inNext30, inCheap };
+  return { state, price: slot.buy_SEK, sellPrice: slot.sell_SEK, slot, inTop10, inNext30, inCheap };
+}
+
+function applySolarReserveCaps(todayHours, tomorrowHours, classesAll) {
+  socCapOverrides.clear();
+
+  if (!solarReserve?.enabled) {
+    console.log("☀️ Solar-reserve: avstängd.");
+    return;
+  }
+
+  const reserveCap = Math.min(HARD_MAX_SOC, Math.max(HARD_MIN_SOC, clamp01(solarReserve.maxMorningSoC ?? HARD_MAX_SOC)));
+  if (reserveCap >= HARD_MAX_SOC - 1e-6) {
+    console.log("☀️ Solar-reserve: maxMorningSoC når hårt tak → ingen begränsning.");
+    return;
+  }
+
+  const monthsArray = Array.isArray(solarReserve.monthsActive) ? solarReserve.monthsActive : [];
+  const activeMonths = new Set(monthsArray);
+  const enforceMonth = activeMonths.size > 0;
+  const startHour = Number.isFinite(solarReserve.startHour) ? Math.max(0, Math.min(23, Math.floor(solarReserve.startHour))) : 0;
+  const releaseHourRaw = Number.isFinite(solarReserve.releaseHour) ? Math.max(0, Math.min(24, Math.floor(solarReserve.releaseHour))) : 11;
+  const releaseHour = Math.max(0, Math.min(24, releaseHourRaw));
+  if (startHour === releaseHour) {
+    console.log("☀️ Solar-reserve: start och stopp är samma timme → hoppar över.");
+    return;
+  }
+  const windowWraps = startHour > releaseHour;
+
+  const expTop10 = (classesAll && classesAll.expTop10 instanceof Set) ? classesAll.expTop10 : new Set();
+  const expNext30 = (classesAll && classesAll.expNext30 instanceof Set) ? classesAll.expNext30 : new Set();
+  const skipExpensive = solarReserve.skipExpensiveHours !== false;
+
+  const summary = {};
+  const register = (date) => {
+    const key = date.toISOString().slice(0, 10);
+    summary[key] = (summary[key] || 0) + 1;
+  };
+
+  const inWindow = (hour) => {
+    if (!windowWraps) return hour >= startHour && hour < releaseHour;
+    return (hour >= startHour) || (hour < releaseHour);
+  };
+
+  const processHours = (hours) => {
+    if (!Array.isArray(hours)) return;
+    for (const h of hours) {
+      if (!h || !h.start) continue;
+      const dt = new Date(h.start);
+      if (Number.isNaN(dt.getTime())) continue;
+      if (enforceMonth) {
+        const month = dt.getMonth() + 1;
+        if (!activeMonths.has(month)) continue;
+      }
+      const hour = dt.getHours();
+      if (!inWindow(hour)) continue;
+      if (skipExpensive) {
+        const key = h.start;
+        if ((expTop10.has(key)) || (expNext30.has(key))) continue;
+      }
+      setSocCapOverride(dt, reserveCap);
+      register(dt);
+    }
+  };
+
+  processHours(todayHours);
+  processHours(tomorrowHours);
+
+  if (Object.keys(summary).length) {
+    console.log(`☀️ Solar-reserve: max SoC ${Math.round(reserveCap*100)}%`, summary);
+  } else {
+    console.log("☀️ Solar-reserve: ingen aktiv begränsning.");
+  }
 }
 
 // =================== MÅL INFÖR IMORGON ===================
@@ -212,17 +409,21 @@ function computeSoCTargetForMidnight(todayHours, tomorrowHours, classesAll) {
 
   const expTomorrowTop10  = tomorrowHours.filter(h => classesAll.expTop10.has(h.start));
   const expTomorrowNext30 = tomorrowHours.filter(h => classesAll.expNext30.has(h.start));
-  const avgExpTomorrow = [...expTomorrowTop10, ...expTomorrowNext30].length
-    ? [...expTomorrowTop10, ...expTomorrowNext30].reduce((a,h)=>a+h.buy_SEK,0)/([ ...expTomorrowTop10, ...expTomorrowNext30 ].length)
+  const expTomorrowAll = [...expTomorrowTop10, ...expTomorrowNext30];
+  const avgSellExpTomorrow = expTomorrowAll.length
+    ? expTomorrowAll.reduce((a,h)=>a + (Number.isFinite(h?.sell_SEK) ? Number(h.sell_SEK) : Number(h.buy_SEK) || 0), 0) / expTomorrowAll.length
     : -Infinity;
-  const expCount = expTomorrowTop10.length + expTomorrowNext30.length;
+  const expCount = expTomorrowAll.length;
 
   if (!tomorrowHours.length || expCount === 0) {
     return { targetSoC: null, profitCheck: null };
   }
 
-  const maxProfitableBuy = avgExpTomorrow * roundTripEff;
-  const profitable = avgCheapTodayRemaining <= maxProfitableBuy;
+  const marginAdjustedSell = Number.isFinite(avgSellExpTomorrow) ? (avgSellExpTomorrow - minimumSellMargin_SEK) : -Infinity;
+  const maxProfitableBuy = (Number.isFinite(marginAdjustedSell) && marginAdjustedSell > 0)
+    ? marginAdjustedSell * roundTripEff
+    : -Infinity;
+  const profitable = Number.isFinite(avgCheapTodayRemaining) && Number.isFinite(maxProfitableBuy) && avgCheapTodayRemaining <= maxProfitableBuy;
 
   const energyNeed_kWh = expCount * maxDischargePower_kW * 1.0; // antag 1h/timme
   const maxFill_kWh = batteryCapacity_kWh * (HARD_MAX_SOC - HARD_MIN_SOC);
@@ -231,16 +432,17 @@ function computeSoCTargetForMidnight(todayHours, tomorrowHours, classesAll) {
   return {
     targetSoC: profitable ? targetSoC : null,
     profitCheck: {
-      avgCheapTodayRemaining: round3(avgCheapTodayRemaining),
-      avgExpTomorrow: round3(avgExpTomorrow),
-      maxProfitableBuy: round3(maxProfitableBuy),
+      avgCheapTodayRemaining: Number.isFinite(avgCheapTodayRemaining) ? round3(avgCheapTodayRemaining) : null,
+      avgSellTomorrow: Number.isFinite(avgSellExpTomorrow) ? round3(avgSellExpTomorrow) : null,
+      requiredBuyForMargin: Number.isFinite(maxProfitableBuy) ? round3(maxProfitableBuy) : null,
+      margin_SEK: round3(minimumSellMargin_SEK),
       profitable
     }
   };
 }
 
 // =================== PLANBYGGARE ===================
-function buildPlan(hours, classes, startSoc, avgBuyOfDay) {
+function buildPlan(hours, classes, startSoc, avgBuyOfDay, cheapAvgBuy) {
   let soc = clamp01(startSoc);
   const plan = [];
 
@@ -252,9 +454,22 @@ function buildPlan(hours, classes, startSoc, avgBuyOfDay) {
     const inNext30 = classes.expNext30.has(h.start);
     const isMid    = !inCheap && !inTop10 && !inNext30;
     const price    = h.buy_SEK || 0;
+    const sellPrice = Number.isFinite(h?.sell_SEK) ? Number(h.sell_SEK) : price;
+    const marginBaseline = Number.isFinite(cheapAvgBuy) ? cheapAvgBuy : (Number.isFinite(avgBuyOfDay) ? avgBuyOfDay : NaN);
+    const marginOk = sellMarginOk(sellPrice, marginBaseline);
 
     let decision = "idle";
     let power_kW = 0;
+
+    const capActive = cap < HARD_MAX_SOC - 1e-6;
+    const aboveCap = soc > cap + 1e-6;
+    let forcedBleed_kW = 0;
+    if (capActive && aboveCap) {
+      const deltaSoc = soc - Math.max(cap, HARD_MIN_SOC);
+      if (deltaSoc > 1e-4) {
+        forcedBleed_kW = round2(Math.min(maxDischargePower_kW, deltaSoc * batteryCapacity_kWh * dischargeEff));
+      }
+    }
 
     if (inCheap) {
       // Ladda mot cap (import OK i cheap)
@@ -263,32 +478,52 @@ function buildPlan(hours, classes, startSoc, avgBuyOfDay) {
       power_kW = round2(toStore_kWh / chargeEff);
       if (power_kW > 0.01) decision = "charge";
     } else if (inTop10) {
-      // Sälj: urladda fritt upp till begränsningar (tillåten export)
       const avail_kWh = Math.max(0, (soc - HARD_MIN_SOC) * batteryCapacity_kWh);
       const canOut_kWh = Math.min(avail_kWh * dischargeEff, maxDischargePower_kW);
-      power_kW = round2(canOut_kWh);
-      if (power_kW > 0.01) decision = "discharge_sell";
+      if (marginOk) {
+        // Sälj: urladda fritt upp till begränsningar (tillåten export)
+        power_kW = round2(canOut_kWh);
+        if (power_kW > 0.01) decision = "discharge";
+      } else {
+        // Marginalen saknas → planera endast load-shaving (ingen export)
+        power_kW = round2(Math.min(canOut_kWh, maxDischargePower_kW));
+        if (power_kW > 0.01) decision = "load_shaving";
+      }
     } else if (inNext30) {
       // Endast last-shaving (ingen export) – i plan går det inte att veta last, så indikera mild discharge
       const avail_kWh = Math.max(0, (soc - midDischargeFloorSoC) * batteryCapacity_kWh);
       const canOut_kWh = Math.min(avail_kWh * dischargeEff, maxDischargePower_kW);
       power_kW = round2(Math.min(canOut_kWh, maxDischargePower_kW)); // indikativt
-      if (power_kW > 0.01) decision = "discharge_shave";
+      if (power_kW > 0.01) decision = "load_shaving";
     } else if (isMid) {
       const midThreshold = (avgBuyOfDay || 0) * priceMidBias;
       if (price >= midThreshold && soc > midDischargeFloorSoC + 1e-3) {
         const availOverFloor_kWh = Math.max(0, (soc - midDischargeFloorSoC) * batteryCapacity_kWh);
         const canOut_kWh = Math.min(availOverFloor_kWh * dischargeEff, maxDischargePower_kW);
         power_kW = round2(canOut_kWh);
-        if (power_kW > 0.01) decision = "discharge_mid";
+        if (power_kW > 0.01) decision = "load_shaving";
+      }
+    }
+
+    if (forcedBleed_kW > 0.01) {
+      if (decision === "charge" || decision === "idle") {
+        decision = "load_shaving";
+        power_kW = forcedBleed_kW;
+      } else if (decision === "load_shaving") {
+        power_kW = Math.max(power_kW, forcedBleed_kW);
+      } else if (decision.startsWith("discharge")) {
+        power_kW = Math.max(power_kW, forcedBleed_kW);
       }
     }
 
     // SoC integrering (respektera hårda gränser)
-    if (decision.startsWith("charge")) {
+    const isChargeDecision = decision.startsWith("charge");
+    const isDischargeDecision = decision.startsWith("discharge") || decision === "load_shaving";
+
+    if (isChargeDecision) {
       const stored_kWh = power_kW * chargeEff;
       soc = clamp01(Math.min(HARD_MAX_SOC, soc + stored_kWh / batteryCapacity_kWh));
-    } else if (decision.startsWith("discharge")) {
+    } else if (isDischargeDecision) {
       const taken_kWh = power_kW / dischargeEff;
       soc = clamp01(Math.max(HARD_MIN_SOC, soc - taken_kWh / batteryCapacity_kWh));
     }
@@ -306,34 +541,68 @@ function buildPlan(hours, classes, startSoc, avgBuyOfDay) {
 }
 
 // =================== REALTIDS-BESLUT ===================
-function decideRealtime(flows_kW, socNow, priceNowState, socTargetEndOfToday, todayHours, classesAll, avgBuyToday) {
+function decideRealtime(flows_kW, socNow, priceNowState, socTargetEndOfToday, todayHours, classesAll, avgBuyToday, avgCheapBuyToday, avgCheapBuyTomorrow, avgCheapBuyAll) {
   const now = new Date();
-  const capNow = capSoCForHour(now);
 
   const pv_surplus_kW = Math.max(0, (flows_kW.prod_kW || 0) - (flows_kW.load_kW || 0));
   const load_gap_kW   = Math.max(0, (flows_kW.load_kW || 0) - (flows_kW.prod_kW || 0));
 
+  const baseCap = capSoCForHour(now);
+  const reserveActive = baseCap < HARD_MAX_SOC - 1e-6;
+  const socClamped = clamp01(socNow);
+
+  let capNow = baseCap;
+  if (pv_surplus_kW > pvNoiseFloor_kW && capNow < HARD_MAX_SOC) {
+    capNow = HARD_MAX_SOC;
+  }
+
   // SoC-baserade begränsningar
-  const room_kWh = Math.max(0, (capNow - Math.min(socNow, HARD_MAX_SOC)) * batteryCapacity_kWh);
+  const room_kWh = Math.max(0, (capNow - Math.min(socClamped, HARD_MAX_SOC)) * batteryCapacity_kWh);
   const socLimitedCharge_kW = Math.max(0, room_kWh / chargeEff);
 
-  const avail_kWh = Math.max(0, (Math.max(socNow, HARD_MIN_SOC) - HARD_MIN_SOC) * batteryCapacity_kWh);
+  const avail_kWh = Math.max(0, (Math.max(socClamped, HARD_MIN_SOC) - HARD_MIN_SOC) * batteryCapacity_kWh);
   const socLimitedDischarge_kW = Math.max(0, avail_kWh * dischargeEff);
-
-  // 0) Solar-first (respektera cap)
-  if (pv_surplus_kW > pvNoiseFloor_kW && socNow < HARD_MAX_SOC - 1e-6) {
-    const p = Math.min(pv_surplus_kW, socLimitedCharge_kW, maxChargePower_kW);
-    if (p > pvNoiseFloor_kW) {
-      return { mode: "charge", power_kW: round2(p), reason: `Solar-first: PV-överskott ${round2(pv_surplus_kW)} kW (cap 90%)` };
-    }
-  }
 
   // Definiera “var är vi i klassningen” för aktuell timme
   const inTop10  = priceNowState.inTop10 === true;
   const inNext30 = priceNowState.inNext30 === true;
+  const slotSellPrice = Number(priceNowState.sellPrice);
+  const marginBaselineNow = marginBaselineForSlot(priceNowState?.slot?.start, avgCheapBuyToday, avgCheapBuyTomorrow, avgCheapBuyAll);
+
+  if (reserveActive && pv_surplus_kW <= pvNoiseFloor_kW && socClamped > baseCap + 1e-3 && socLimitedDischarge_kW > pvNoiseFloor_kW) {
+    const deltaSoc = socClamped - Math.max(baseCap, HARD_MIN_SOC);
+    if (deltaSoc > 1e-4) {
+      const bleedNeed_kW = Math.min(maxDischargePower_kW, socLimitedDischarge_kW, deltaSoc * batteryCapacity_kWh * dischargeEff);
+      const loadTarget = Math.min(load_gap_kW, bleedNeed_kW);
+      if (loadTarget > pvNoiseFloor_kW) {
+        return { mode: "discharge", power_kW: round2(loadTarget), reason: `RESERVE: sänker SoC mot ${Math.round(baseCap*100)}%` };
+      }
+      if (inTop10 && sellMarginOk(slotSellPrice, marginBaselineNow) && bleedNeed_kW > pvNoiseFloor_kW) {
+        return { mode: "discharge", power_kW: round2(bleedNeed_kW), reason: `RESERVE: export för att nå ${Math.round(baseCap*100)}%` };
+      }
+    }
+  }
+
+  // 0) Solar-first (respektera cap)
+  if (pv_surplus_kW > pvNoiseFloor_kW && socClamped < HARD_MAX_SOC - 1e-6) {
+    const p = Math.min(pv_surplus_kW, socLimitedCharge_kW, maxChargePower_kW);
+    if (p > pvNoiseFloor_kW) {
+      return { mode: "charge", power_kW: round2(p), reason: `Solar-first: PV-överskott ${round2(pv_surplus_kW)} kW (cap ${Math.round(capNow*100)}%)` };
+    }
+  }
 
   // 1) Dyraste 10% → export tillåten (sälj)
   if (inTop10) {
+    const marginReady = sellMarginOk(slotSellPrice, marginBaselineNow);
+    if (!marginReady) {
+      if (socLimitedDischarge_kW > 0) {
+        const shaveTarget = Math.min(load_gap_kW, socLimitedDischarge_kW, maxDischargePower_kW);
+        if (shaveTarget > 0) {
+          return { mode: "discharge", power_kW: round2(shaveTarget), reason: `SELL: marginal < ${Math.round(minimumSellMargin_SEK*100)} öre → load-shaving` };
+        }
+      }
+      return { mode: "idle", power_kW: 0, reason: `SELL: marginal < ${Math.round(minimumSellMargin_SEK*100)} öre (sparar batteriet)` };
+    }
     if (socLimitedDischarge_kW > 0) {
       const target = Math.min(maxDischargePower_kW, socLimitedDischarge_kW);
       return { mode: "discharge", power_kW: round2(target), reason: `SELL: topp 10% dyrast – export OK` };
@@ -352,16 +621,16 @@ function decideRealtime(flows_kW, socNow, priceNowState, socTargetEndOfToday, to
   }
 
   // 3) Billigt → ladda (import OK), men aldrig över 90%
-  if (priceNowState.state === "cheap" && allowGridChargeWhenCheap && socNow < HARD_MAX_SOC - 1e-6) {
+  if (priceNowState.state === "cheap" && allowGridChargeWhenCheap && socClamped < HARD_MAX_SOC - 1e-6) {
     const p = Math.min(socLimitedCharge_kW, maxChargePower_kW);
-    if (p > 0) return { mode: "charge", power_kW: round2(p), reason: `CHEAP: laddar (cap 90%)` };
+    if (p > 0) return { mode: "charge", power_kW: round2(p), reason: `CHEAP: laddar (cap ${Math.round(baseCap*100)}%)` };
   }
 
   // 4) “Mid” → ev. last-shaving om pris ≥ snitt*bias (ingen export)
   if (priceNowState.state === "normal") {
     const midThreshold = (avgBuyToday || 0) * priceMidBias;
-    if (priceNowState.price >= midThreshold && socNow > midDischargeFloorSoC + 1e-3) {
-      const availOverFloor_kWh = Math.max(0, (socNow - midDischargeFloorSoC) * batteryCapacity_kWh);
+    if (priceNowState.price >= midThreshold && socClamped > midDischargeFloorSoC + 1e-3) {
+      const availOverFloor_kWh = Math.max(0, (socClamped - midDischargeFloorSoC) * batteryCapacity_kWh);
       const allow_kW = Math.min(availOverFloor_kWh * dischargeEff, maxDischargePower_kW);
       const target = Math.min(load_gap_kW, allow_kW); // begränsa till last → ingen export
       if (target > 0) return { mode: "discharge", power_kW: round2(target), reason: `MID: shavar import (buffert ≥ ${Math.round(midDischargeFloorSoC*100)}%)` };
@@ -369,9 +638,9 @@ function decideRealtime(flows_kW, socNow, priceNowState, socTargetEndOfToday, to
   }
 
   // 5) Ladda mot mål till midnatt om det behövs (ej över 90)
-  if (socTargetEndOfToday != null && clamp01(socNow) < socTargetEndOfToday && allowGridChargeToMeetTomorrowGoal) {
+  if (socTargetEndOfToday != null && socClamped < socTargetEndOfToday && allowGridChargeToMeetTomorrowGoal) {
     const p = Math.min(socLimitedCharge_kW, maxChargePower_kW);
-    if (p > 0) return { mode: "charge", power_kW: round2(p), reason: `Mot mål till midnatt (cap 90%)` };
+    if (p > 0) return { mode: "charge", power_kW: round2(p), reason: `Mot mål till midnatt (cap ${Math.round(capNow*100)}%)` };
   }
 
   return { mode: "idle", power_kW: 0, reason: "Neutral: ingen PV-överskott/pristrigger" };
@@ -411,6 +680,9 @@ async function main() {
   const priceNowState   = priceStateNow([...todayHours, ...tomorrowHours], classesAll);
   const classesTomorrow = classifyPrices(tomorrowHours);
   const avgBuyTodaySEK  = avgBuy(todayHours);
+  const avgCheapBuyTodaySEK = averagePriceForSet(todayHours, classesToday.cheapSet, 'buy_SEK');
+  const avgCheapBuyTomorrowSEK = averagePriceForSet(tomorrowHours, classesTomorrow.cheapSet, 'buy_SEK');
+  const avgCheapBuyAllSEK = averagePriceForSet([...todayHours, ...tomorrowHours], classesAll.cheapSet, 'buy_SEK');
 
   console.log("💸 Pris nu:", { state: priceNowState.state, price_buy_SEK_per_kWh: round2(priceNowState.price || NaN), avg_buy_today: round2(avgBuyTodaySEK) });
 
@@ -419,15 +691,19 @@ async function main() {
   if (profitCheck) console.log("📈 Lönsamhetskoll inför imorgon:", profitCheck);
   if (targetSoC != null) console.log("🎯 SoC-mål till midnatt:", `${Math.round(targetSoC*100)}%`);
 
+  applySolarReserveCaps(todayHours, tomorrowHours, classesAll);
+  const capNowForLog = capSoCForHour(new Date());
+  console.log("🔝 SoC-cap nu:", `${Math.round(capNowForLog*100)}%`);
+
   // Realtidsbeslut
-  const actionNow = decideRealtime(flows_kW, battery_soc, priceNowState, targetSoC, todayHours, classesAll, avgBuyTodaySEK);
+  const actionNow = decideRealtime(flows_kW, battery_soc, priceNowState, targetSoC, todayHours, classesAll, avgBuyTodaySEK, avgCheapBuyTodaySEK, avgCheapBuyTomorrowSEK, avgCheapBuyAllSEK);
   const safeMode = normalizeMode(actionNow.mode);
   const power_W = Math.max(0, Math.round(actionNow.power_kW * 1000)); // positiv effekt, riktning via mode
 
   // ===== Plan (resterande idag) =====
   const now = new Date();
   const futureToday = todayHours.filter(h => new Date(h.start) > now);
-  const planToday = buildPlan(futureToday, classesToday, battery_soc, avgBuyTodaySEK);
+  const planToday = buildPlan(futureToday, classesToday, battery_soc, avgBuyTodaySEK, avgCheapBuyTodaySEK);
 
   console.log("🗓️ Plan (resterande idag):");
   if (planToday.length === 0) console.log("— Inga timmar kvar idag.");
@@ -443,21 +719,23 @@ async function main() {
   } else {
     const startSocTomorrow   = (targetSoC != null) ? targetSoC : socAtMidnight;
     const avgBuyTomorrowSEK  = avgBuy(tomorrowHours);
-    planTomorrow = buildPlan(tomorrowHours, classesTomorrow, startSocTomorrow, avgBuyTomorrowSEK);
+    planTomorrow = buildPlan(tomorrowHours, classesTomorrow, startSocTomorrow, avgBuyTomorrowSEK, avgCheapBuyTomorrowSEK);
     planTomorrow.forEach(p => console.log(`${p.hourStartISO} → ${p.decision.toUpperCase()} @ ${p.targetPower_kW} kW (SoC end: ${(p.socEnd*100).toFixed(1)}%) [${p.price_buy_SEK} kr/kWh]`));
   }
 
   // =================== TAGS (String/Number wrappers) ===================
-  setTagString('battery_action', safeMode);                               // 'charge' | 'discharge' | 'idle'
-  setTagNumber('battery_power_W', power_W);                               // positiv W
-  setTagString('battery_reason', actionNow.reason || '');
+  await setTagString('battery_action', safeMode);                               // 'charge' | 'discharge' | 'idle'
+  await setTagNumber('battery_power_W', power_W);                               // positiv W
+  await setTagString('battery_reason', actionNow.reason || '');
 
-  setTagNumber('battery_soc_percent', Math.round((battery_soc ?? 0) * 100));
-  setTagNumber('price_now_SEK_per_kWh', Number.isFinite(priceNowState.price) ? round2(priceNowState.price) : 0);
-  setTagNumber('target_soc_end_today_percent', (targetSoC != null && Number.isFinite(targetSoC)) ? Math.round(targetSoC * 100) : 0);
+  await setTagNumber('battery_soc_percent', Math.round((battery_soc ?? 0) * 100));
+  await setTagNumber('price_now_SEK_per_kWh', Number.isFinite(priceNowState.price) ? round2(priceNowState.price) : 0);
+  await setTagNumber('target_soc_end_today_percent', (targetSoC != null && Number.isFinite(targetSoC)) ? Math.round(targetSoC * 100) : 0);
+  await setTagNumber('battery_soc_cap_percent', Math.round((capNowForLog ?? HARD_MAX_SOC) * 100));
+  await setTagNumber('solar_reserve_active', (capNowForLog < HARD_MAX_SOC - 1e-6) ? 1 : 0);
 
-  try { setTagString('plan_today_json', JSON.stringify(planToday || [])); } catch (_) { setTagString('plan_today_json', '[]'); }
-  try { setTagString('plan_tomorrow_json', JSON.stringify(planTomorrow || [])); } catch (_) { setTagString('plan_tomorrow_json', '[]'); }
+  try { await setTagString('plan_today_json', JSON.stringify(planToday || [])); } catch (_) { await setTagString('plan_today_json', '[]'); }
+  try { await setTagString('plan_tomorrow_json', JSON.stringify(planTomorrow || [])); } catch (_) { await setTagString('plan_tomorrow_json', '[]'); }
 
   console.log("🚦 Beslut NU:", { mode: safeMode, power_kW: actionNow.power_kW, reason: actionNow.reason }, "| power_W:", power_W);
 
