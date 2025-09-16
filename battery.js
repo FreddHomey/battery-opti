@@ -31,8 +31,8 @@ const roundTripEff         = 0.92;
 const chargeEff            = Math.sqrt(roundTripEff);
 const dischargeEff         = Math.sqrt(roundTripEff);
 
-// Marginalkrav för urladdning (batterislitage)
-const minimumSellMargin_SEK = 0.50; // kräver minst 50 öre vinst per kWh
+// Marginalkrav för export (slitage)
+const minimumSellMargin_SEK = 0.50; // minst 50 öre marginal för att sälja till nätet
 
 // Pris-klasser
 const cheapPercent       = 0.30; // billigaste 30% → ladda
@@ -44,14 +44,14 @@ const allowGridChargeWhenCheap          = true; // tillåten import i cheap
 const allowGridChargeToMeetTomorrowGoal = true; // ladda mot mål till midnatt om lönsamt
 const pvNoiseFloor_kW = 0.01;
 
-// Håll morgonbuffert för solenergi (används främst mars–sept)
+// Håll morgonbuffert för solenergi (framförallt mars–sept)
 const solarReserve = {
   enabled: true,
-  maxMorningSoC: 0.75,     // 75% → lämna ~25% ledigt för PV
-  startHour: 0,            // gäller från midnatt …
-  releaseHour: 11,         // … till kl 11 (exklusive)
+  maxMorningSoC: 0.75,     // 75% → lämna 25% till PV
+  startHour: 0,
+  releaseHour: 11,
   monthsActive: [3,4,5,6,7,8,9], // mars–sept (1=jan)
-  skipExpensiveHours: false // true = hoppa över timmar som är klassade som dyra
+  skipExpensiveHours: false // true = hoppa dyra timmar
 };
 
 // “Mid”/buffert
@@ -86,19 +86,6 @@ function capSoCForHour(date){
   const override = socCapOverrides.get(key);
   return (override != null) ? override : HARD_MAX_SOC;
 } // hårt tak 90%
-
-function slotDurationHours(slot) {
-  if (!slot) return 1;
-  const start = new Date(slot.start ?? slot.hourStartISO ?? slot);
-  const end = slot.end ? new Date(slot.end) : null;
-  if (Number.isNaN(start.getTime())) return 1;
-  let durationMs = 60 * 60 * 1000; // default 1h
-  if (end && !Number.isNaN(end.getTime())) {
-    durationMs = Math.max(1, end.getTime() - start.getTime());
-  }
-  const hours = durationMs / (60 * 60 * 1000);
-  return Math.max(1 / 60, Number.isFinite(hours) ? hours : 1);
-}
 
 function normalizeMode(m) {
   if (m === 'charge' || m === 'discharge' || m === 'idle') return m;
@@ -157,7 +144,6 @@ async function setTagString(name, value) {
   ];
   return updateTag(name, "String", candidates);
 }
-
 async function setTagNumber(name, value) {
   const num = Number.isFinite(value) ? Number(value) : 0;
   const candidates = [
@@ -222,6 +208,19 @@ function balanceCheck({ prod_kW, load_kW, gridImport_kW, gridExport_kW, battChar
   const right = load_kW + gridExport_kW + battCharge_kW;
   const diff = left - right;
   return { left: round3(left), right: round3(right), diff: round3(diff), ok: Math.abs(diff) < 0.2 };
+}
+
+function slotDurationHours(slot) {
+  if (!slot) return 1;
+  const start = new Date(slot.start ?? slot.hourStartISO ?? slot);
+  const end = slot.end ? new Date(slot.end) : null;
+  if (Number.isNaN(start.getTime())) return 1;
+  let durationMs = 60 * 60 * 1000; // default 1h
+  if (end && !Number.isNaN(end.getTime())) {
+    durationMs = Math.max(1, end.getTime() - start.getTime());
+  }
+  const hours = durationMs / (60 * 60 * 1000);
+  return Math.max(1 / 60, Number.isFinite(hours) ? hours : 1);
 }
 
 function averagePriceForSet(hours, keySet, field) {
@@ -394,7 +393,7 @@ function applySolarReserveCaps(todayHours, tomorrowHours, classesAll) {
       if (!inWindow(hour)) continue;
       if (skipExpensive) {
         const key = h.start;
-        if ((expTop10.has(key)) || (expNext30.has(key))) continue;
+        if (expTop10.has(key) || expNext30.has(key)) continue;
       }
       setSocCapOverride(dt, reserveCap);
       register(dt);
@@ -571,7 +570,6 @@ function buildPlan(hours, classes, startSoc, avgBuyOfDay, cheapAvgBuy) {
     const midBudgetPower_kW = midBudget_kWh / duration;
 
     if (inCheap) {
-      // Ladda mot cap (import OK i cheap)
       const room_kWh = Math.max(0, (cap - soc) * batteryCapacity_kWh);
       const maxChargeEnergy_kWh = maxChargePower_kW * duration * chargeEff;
       const toStore_kWh = Math.min(room_kWh, maxChargeEnergy_kWh);
