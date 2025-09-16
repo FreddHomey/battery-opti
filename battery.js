@@ -346,17 +346,47 @@ function computeSoCTargetForMidnight(todayHours, tomorrowHours, classesAll) {
 
 // =================== PLANBYGGARE ===================
 function buildPlan(hours, classes, startSoc, avgBuyOfDay) {
-  let soc = clamp01(startSoc);
   const plan = [];
+  if (!Array.isArray(hours) || hours.length === 0) return plan;
 
-  for (const h of hours) {
+  const initialSoc = clamp01(startSoc);
+  const midThreshold = (avgBuyOfDay || 0) * priceMidBias;
+
+  const hourMeta = hours.map(h => {
+    const key = h.start;
+    const inCheap  = classes.cheapSet.has(key);
+    const inTop10  = classes.expTop10.has(key);
+    const inNext30 = classes.expNext30.has(key);
+    const isMid    = !inCheap && !inTop10 && !inNext30;
+    const priceBuy = h.buy_SEK || 0;
+    const sell_SEK = Number.isFinite(h.sell_SEK) ? h.sell_SEK : 0;
+    const qualifiesMid = isMid && priceBuy >= midThreshold;
+    return { h, key, inCheap, inTop10, inNext30, isMid, qualifiesMid, priceBuy, sell_SEK };
+  });
+
+  const dischargeCandidates = hourMeta.filter(meta => meta.inTop10 || meta.inNext30 || meta.qualifiesMid);
+  dischargeCandidates.sort((a, b) => b.sell_SEK - a.sell_SEK);
+
+  const totalStored_kWh = Math.max(0, (initialSoc - HARD_MIN_SOC) * batteryCapacity_kWh);
+  let remainingDeliverable_kWh = totalStored_kWh * dischargeEff;
+  const dischargeAllocation_kWh = new Map();
+  for (const cand of dischargeCandidates) {
+    if (remainingDeliverable_kWh <= 1e-6) break;
+    const alloc = Math.min(remainingDeliverable_kWh, maxDischargePower_kW);
+    if (alloc > 1e-6) {
+      dischargeAllocation_kWh.set(cand.key, alloc);
+      remainingDeliverable_kWh -= alloc;
+    }
+  }
+
+  let soc = initialSoc;
+
+  for (const meta of hourMeta) {
+    const { h, key, inCheap, inTop10, inNext30, isMid, qualifiesMid, priceBuy } = meta;
     const dt = new Date(h.start);
     const cap = capSoCForHour(dt);
-    const inCheap  = classes.cheapSet.has(h.start);
-    const inTop10  = classes.expTop10.has(h.start);
-    const inNext30 = classes.expNext30.has(h.start);
-    const isMid    = !inCheap && !inTop10 && !inNext30;
-    const price    = h.buy_SEK || 0;
+    const price = priceBuy;
+    const allocated_kWh = dischargeAllocation_kWh.get(key) || 0;
 
     let decision = "idle";
     let power_kW = 0;
@@ -371,20 +401,22 @@ function buildPlan(hours, classes, startSoc, avgBuyOfDay) {
       // Sälj: urladda fritt upp till begränsningar (tillåten export)
       const avail_kWh = Math.max(0, (soc - HARD_MIN_SOC) * batteryCapacity_kWh);
       const canOut_kWh = Math.min(avail_kWh * dischargeEff, maxDischargePower_kW);
-      power_kW = round2(canOut_kWh);
+      const planned_kWh = Math.min(canOut_kWh, allocated_kWh);
+      power_kW = round2(planned_kWh);
       if (power_kW > 0.01) decision = "discharge_sell";
     } else if (inNext30) {
       // Endast last-shaving (ingen export) – i plan går det inte att veta last, så indikera mild discharge
       const avail_kWh = Math.max(0, (soc - midDischargeFloorSoC) * batteryCapacity_kWh);
       const canOut_kWh = Math.min(avail_kWh * dischargeEff, maxDischargePower_kW);
-      power_kW = round2(Math.min(canOut_kWh, maxDischargePower_kW)); // indikativt
+      const planned_kWh = Math.min(canOut_kWh, allocated_kWh);
+      power_kW = round2(planned_kWh);
       if (power_kW > 0.01) decision = "discharge_shave";
-    } else if (isMid) {
-      const midThreshold = (avgBuyOfDay || 0) * priceMidBias;
-      if (price >= midThreshold && soc > midDischargeFloorSoC + 1e-3) {
+    } else if (isMid && qualifiesMid) {
+      if (soc > midDischargeFloorSoC + 1e-3) {
         const availOverFloor_kWh = Math.max(0, (soc - midDischargeFloorSoC) * batteryCapacity_kWh);
         const canOut_kWh = Math.min(availOverFloor_kWh * dischargeEff, maxDischargePower_kW);
-        power_kW = round2(canOut_kWh);
+        const planned_kWh = Math.min(canOut_kWh, allocated_kWh);
+        power_kW = round2(planned_kWh);
         if (power_kW > 0.01) decision = "discharge_mid";
       }
     }
