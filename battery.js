@@ -87,6 +87,19 @@ function capSoCForHour(date){
   return (override != null) ? override : HARD_MAX_SOC;
 } // hårt tak 90%
 
+function slotDurationHours(slot) {
+  if (!slot) return 1;
+  const start = new Date(slot.start ?? slot.hourStartISO ?? slot);
+  const end = slot.end ? new Date(slot.end) : null;
+  if (Number.isNaN(start.getTime())) return 1;
+  let durationMs = 60 * 60 * 1000; // default 1h
+  if (end && !Number.isNaN(end.getTime())) {
+    durationMs = Math.max(1, end.getTime() - start.getTime());
+  }
+  const hours = durationMs / (60 * 60 * 1000);
+  return Math.max(1 / 60, Number.isFinite(hours) ? hours : 1);
+}
+
 function normalizeMode(m) {
   if (m === 'charge' || m === 'discharge' || m === 'idle') return m;
   if (m && String(m).toLowerCase().startsWith('discharge')) return 'discharge';
@@ -450,6 +463,10 @@ function buildPlan(hours, classes, startSoc, avgBuyOfDay, cheapAvgBuy) {
     ? avgBuyOfDay * priceMidBias
     : Infinity;
 
+  const marginBaselineDefault = Number.isFinite(cheapAvgBuy)
+    ? cheapAvgBuy
+    : (Number.isFinite(avgBuyOfDay) ? avgBuyOfDay : NaN);
+
   const dischargeCandidates = [];
   if (Array.isArray(hours)) {
     for (const h of hours) {
@@ -458,48 +475,62 @@ function buildPlan(hours, classes, startSoc, avgBuyOfDay, cheapAvgBuy) {
       const inCheap = classes.cheapSet.has(key);
       const inTop10 = classes.expTop10.has(key);
       const inNext30 = classes.expNext30.has(key);
-      const sellPriceRaw = Number(h?.sell_SEK);
       const buyPriceRaw = Number(h?.buy_SEK);
-      const sortPrice = Number.isFinite(sellPriceRaw)
-        ? sellPriceRaw
-        : (Number.isFinite(buyPriceRaw) ? buyPriceRaw : -Infinity);
+      const sellPriceRaw = Number(h?.sell_SEK);
+      const duration = slotDurationHours(h);
+
       const qualifiesMid = !inCheap
         && !inTop10
         && !inNext30
         && Number.isFinite(midPriceThreshold)
         && Number.isFinite(buyPriceRaw)
         && buyPriceRaw >= midPriceThreshold;
-      if (inTop10 || inNext30 || qualifiesMid) {
-        const ts = new Date(key).getTime();
-        const order = Number.isFinite(ts) ? ts : 0;
-        dischargeCandidates.push({ start: key, price: sortPrice, order });
-      }
+      if (!inTop10 && !inNext30 && !qualifiesMid) continue;
+
+      const classRank = inTop10 ? 3 : (inNext30 ? 2 : 1);
+      const sortPrice = Number.isFinite(sellPriceRaw)
+        ? sellPriceRaw
+        : (Number.isFinite(buyPriceRaw) ? buyPriceRaw : -Infinity);
+      const marginOk = sellMarginOk(sellPriceRaw, marginBaselineDefault);
+      const ts = new Date(key).getTime();
+      const order = Number.isFinite(ts) ? ts : 0;
+      const marginBonus = marginOk ? 100 : 0;
+      const score = sortPrice + marginBonus + classRank * 5;
+
+      dischargeCandidates.push({
+        start: key,
+        score,
+        order,
+        duration,
+        maxEnergy_kWh: maxDischargePower_kW * duration
+      });
     }
   }
 
   dischargeCandidates.sort((a, b) => {
-    if (b.price !== a.price) return b.price - a.price;
+    if (b.score !== a.score) return b.score - a.score;
     return a.order - b.order;
   });
 
-  const startDeliverableBudget = Math.max(0, (startSocClamped - HARD_MIN_SOC) * batteryCapacity_kWh * dischargeEff);
-  let remainingDeliverableBudget = startDeliverableBudget;
+  const startDeliverableBudget_kWh = Math.max(0, (startSocClamped - HARD_MIN_SOC) * batteryCapacity_kWh) * dischargeEff;
+  let remainingDeliverableBudget_kWh = startDeliverableBudget_kWh;
   const dischargeAllocation = new Map();
   for (const candidate of dischargeCandidates) {
     if (!candidate || !candidate.start) continue;
-    if (remainingDeliverableBudget <= 1e-6) break;
+    if (remainingDeliverableBudget_kWh <= 1e-6) break;
     if (dischargeAllocation.has(candidate.start)) continue;
-    const allocation = Math.min(remainingDeliverableBudget, maxDischargePower_kW);
-    if (allocation <= 1e-6) continue;
-    dischargeAllocation.set(candidate.start, allocation);
-    remainingDeliverableBudget = Math.max(0, remainingDeliverableBudget - allocation);
+    const capacityForSlot_kWh = Math.max(0, Math.min(candidate.maxEnergy_kWh, remainingDeliverableBudget_kWh));
+    if (capacityForSlot_kWh <= 1e-6) continue;
+    dischargeAllocation.set(candidate.start, capacityForSlot_kWh);
+    remainingDeliverableBudget_kWh -= capacityForSlot_kWh;
   }
 
-  const totalReservedDeliverable = startDeliverableBudget - remainingDeliverableBudget;
-  let totalReservedRemaining = Math.max(0, totalReservedDeliverable);
+  let totalReservedRemaining_kWh = startDeliverableBudget_kWh - remainingDeliverableBudget_kWh;
+  totalReservedRemaining_kWh = Math.max(0, totalReservedRemaining_kWh);
 
   for (const h of hours) {
     const dt = new Date(h.start);
+    const duration = slotDurationHours(h);
     const cap = capSoCForHour(dt);
     const inCheap  = classes.cheapSet.has(h.start);
     const inTop10  = classes.expTop10.has(h.start);
@@ -507,7 +538,7 @@ function buildPlan(hours, classes, startSoc, avgBuyOfDay, cheapAvgBuy) {
     const isMid    = !inCheap && !inTop10 && !inNext30;
     const price    = h.buy_SEK || 0;
     const sellPrice = Number.isFinite(h?.sell_SEK) ? Number(h.sell_SEK) : price;
-    const marginBaseline = Number.isFinite(cheapAvgBuy) ? cheapAvgBuy : (Number.isFinite(avgBuyOfDay) ? avgBuyOfDay : NaN);
+    const marginBaseline = marginBaselineDefault;
     const marginOk = sellMarginOk(sellPrice, marginBaseline);
 
     let decision = "idle";
@@ -515,89 +546,99 @@ function buildPlan(hours, classes, startSoc, avgBuyOfDay, cheapAvgBuy) {
 
     const capActive = cap < HARD_MAX_SOC - 1e-6;
     const aboveCap = soc > cap + 1e-6;
-    let forcedBleed_kW = 0;
+    let forcedBleedPower_kW = 0;
     if (capActive && aboveCap) {
       const deltaSoc = soc - Math.max(cap, HARD_MIN_SOC);
       if (deltaSoc > 1e-4) {
-        forcedBleed_kW = round2(Math.min(maxDischargePower_kW, deltaSoc * batteryCapacity_kWh * dischargeEff));
+        const bleedEnergy_kWh = deltaSoc * batteryCapacity_kWh * dischargeEff;
+        forcedBleedPower_kW = Math.min(maxDischargePower_kW, bleedEnergy_kWh / duration);
       }
     }
 
-    const avail_kWh = Math.max(0, (soc - HARD_MIN_SOC) * batteryCapacity_kWh);
-    const deliverableAvailableNow = Math.max(0, avail_kWh * dischargeEff);
-    const canOut_kWh = Math.min(deliverableAvailableNow, maxDischargePower_kW);
-    const reservedRaw = dischargeAllocation.get(h.start);
-    const reservedForHour = (typeof reservedRaw === "number" && Number.isFinite(reservedRaw)) ? reservedRaw : 0;
-    const reservedForFuture = Math.max(0, totalReservedRemaining - reservedForHour);
-    let dischargeLimitThisHour = deliverableAvailableNow - reservedForFuture;
-    if (!Number.isFinite(dischargeLimitThisHour)) dischargeLimitThisHour = 0;
-    dischargeLimitThisHour = Math.max(0, dischargeLimitThisHour);
-    dischargeLimitThisHour = Math.min(dischargeLimitThisHour, canOut_kWh);
+    const reservedRaw_kWh = dischargeAllocation.get(h.start);
+    const reservedForHour_kWh = (typeof reservedRaw_kWh === "number" && Number.isFinite(reservedRaw_kWh)) ? reservedRaw_kWh : 0;
+    const reservedForFuture_kWh = Math.max(0, totalReservedRemaining_kWh - reservedForHour_kWh);
+
+    const energyAboveMin_kWh = Math.max(0, (soc - HARD_MIN_SOC) * batteryCapacity_kWh);
+    const deliverableNow_kWh = energyAboveMin_kWh * dischargeEff;
+    let dischargeBudget_kWh = deliverableNow_kWh - reservedForFuture_kWh;
+    if (!Number.isFinite(dischargeBudget_kWh)) dischargeBudget_kWh = 0;
+    dischargeBudget_kWh = Math.max(0, Math.min(dischargeBudget_kWh, maxDischargePower_kW * duration));
+    let dischargeBudgetPower_kW = dischargeBudget_kWh / duration;
+
+    const energyAboveMid_kWh = Math.max(0, (soc - midDischargeFloorSoC) * batteryCapacity_kWh);
+    const midBudget_kWh = Math.min(energyAboveMid_kWh * dischargeEff, maxDischargePower_kW * duration);
+    const midBudgetPower_kW = midBudget_kWh / duration;
 
     if (inCheap) {
       // Ladda mot cap (import OK i cheap)
       const room_kWh = Math.max(0, (cap - soc) * batteryCapacity_kWh);
-      const toStore_kWh = Math.min(room_kWh, maxChargePower_kW * chargeEff);
-      power_kW = round2(toStore_kWh / chargeEff);
+      const maxChargeEnergy_kWh = maxChargePower_kW * duration * chargeEff;
+      const toStore_kWh = Math.min(room_kWh, maxChargeEnergy_kWh);
+      power_kW = (toStore_kWh > 1e-6 && duration > 0) ? (toStore_kWh / (chargeEff * duration)) : 0;
       if (power_kW > 0.01) decision = "charge";
     } else if (inTop10) {
+      const allowedPower = Math.min(dischargeBudgetPower_kW, maxDischargePower_kW);
       if (marginOk) {
-        // Sälj: urladda fritt upp till begränsningar (tillåten export)
-        const allowed = dischargeLimitThisHour;
-        power_kW = allowed > 0.01 ? round2(allowed) : 0;
-        if (power_kW > 0.01) decision = "discharge";
+        if (allowedPower > 0.01) {
+          power_kW = round2(allowedPower);
+          decision = "discharge";
+        }
       } else {
-        // Marginalen saknas → planera endast load-shaving (ingen export)
-        const allowed = dischargeLimitThisHour;
-        power_kW = allowed > 0.01 ? round2(allowed) : 0;
-        if (power_kW > 0.01) decision = "load_shaving";
+        const shavePower = Math.min(allowedPower, midBudgetPower_kW);
+        if (shavePower > 0.01) {
+          power_kW = round2(shavePower);
+          decision = "load_shaving";
+        }
       }
     } else if (inNext30) {
-      // Endast last-shaving (ingen export) – i plan går det inte att veta last, så indikera mild discharge
-      const availOverFloor_kWh = Math.max(0, (soc - midDischargeFloorSoC) * batteryCapacity_kWh);
-      const canOutMid_kWh = Math.min(availOverFloor_kWh * dischargeEff, maxDischargePower_kW);
-      const allowed = Math.min(dischargeLimitThisHour, canOutMid_kWh);
-      power_kW = allowed > 0.01 ? round2(allowed) : 0;
-      if (power_kW > 0.01) decision = "load_shaving";
+      const allowedPower = Math.min(dischargeBudgetPower_kW, midBudgetPower_kW);
+      if (allowedPower > 0.01) {
+        power_kW = round2(allowedPower);
+        decision = "load_shaving";
+      }
     } else if (isMid) {
       if (Number.isFinite(midPriceThreshold) && price >= midPriceThreshold && soc > midDischargeFloorSoC + 1e-3) {
-        const availOverFloor_kWh = Math.max(0, (soc - midDischargeFloorSoC) * batteryCapacity_kWh);
-        const canOutMid_kWh = Math.min(availOverFloor_kWh * dischargeEff, maxDischargePower_kW);
-        const allowed = Math.min(dischargeLimitThisHour, canOutMid_kWh);
-        power_kW = allowed > 0.01 ? round2(allowed) : 0;
-        if (power_kW > 0.01) decision = "load_shaving";
+        const allowedPower = Math.min(dischargeBudgetPower_kW, midBudgetPower_kW);
+        if (allowedPower > 0.01) {
+          power_kW = round2(allowedPower);
+          decision = "load_shaving";
+        }
       }
     }
 
-    if (forcedBleed_kW > power_kW) {
-      const bleedAllowed = Math.min(canOut_kWh, forcedBleed_kW);
-      if (bleedAllowed > power_kW) {
-        power_kW = round2(bleedAllowed);
+    if (forcedBleedPower_kW > power_kW) {
+      const bleedPower = Math.min(maxDischargePower_kW, forcedBleedPower_kW);
+      if (bleedPower > power_kW) {
+        power_kW = round2(bleedPower);
         if (decision === "charge" || decision === "idle") {
           decision = "load_shaving";
         }
       }
     }
 
-    totalReservedRemaining = Math.max(0, totalReservedRemaining - reservedForHour);
-    dischargeAllocation.delete(h.start);
-
-    // SoC integrering (respektera hårda gränser)
     const isChargeDecision = decision.startsWith("charge");
     const isDischargeDecision = decision.startsWith("discharge") || decision === "load_shaving";
+    const deliveredEnergy_kWh = isDischargeDecision ? power_kW * duration : 0;
+    let extraFromFuture_kWh = deliveredEnergy_kWh - Math.max(0, dischargeBudget_kWh);
+    if (!Number.isFinite(extraFromFuture_kWh) || extraFromFuture_kWh < 1e-6) extraFromFuture_kWh = 0;
+    let reservedTotalAfter_kWh = reservedForFuture_kWh - extraFromFuture_kWh;
+    if (!Number.isFinite(reservedTotalAfter_kWh)) reservedTotalAfter_kWh = 0;
+    totalReservedRemaining_kWh = Math.max(0, reservedTotalAfter_kWh);
+    dischargeAllocation.delete(h.start);
 
     if (isChargeDecision) {
-      const stored_kWh = power_kW * chargeEff;
+      const stored_kWh = power_kW * duration * chargeEff;
       soc = clamp01(Math.min(HARD_MAX_SOC, soc + stored_kWh / batteryCapacity_kWh));
     } else if (isDischargeDecision) {
-      const taken_kWh = power_kW / dischargeEff;
+      const taken_kWh = (power_kW * duration) / dischargeEff;
       soc = clamp01(Math.max(HARD_MIN_SOC, soc - taken_kWh / batteryCapacity_kWh));
     }
 
     plan.push({
       hourStartISO: h.start,
       decision,
-      targetPower_kW: power_kW,
+      targetPower_kW: round2(power_kW),
       socEnd: round3(soc),
       price_buy_SEK: round2(price)
     });
